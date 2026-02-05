@@ -117,7 +117,14 @@ class VoiceRecorderApp:
         self.q_options = {"OFF": 0, "1/4": 1.0, "1/8": 0.5, "1/16": 0.25, "1/32": 0.125}
         self.cur_q = tk.StringVar(value="OFF")
         self.tracks, self.active_track_idx, self.custom_scale = [], 0, [True] * 12
-        self.scale_key_btns, self.knob_refs, self.knob_hovered = {}, {}, False 
+        self.scale_key_btns, self.knob_refs, self.knob_updates = {}, {}, {}
+        self.knob_hovered = None
+        self.selected_note = None
+        self.drag_note = None
+        self.drag_start_x = 0
+        self.drag_start_dur = 0
+        self.duplicate_note = None
+        self.duplicate_after_id = None
 
         self._build_main_layout()
         self.add_track(False) 
@@ -189,6 +196,10 @@ class VoiceRecorderApp:
         self.right_container = tk.Frame(self.workspace, bg="#121212"); self.right_container.pack(side="right", fill="both", expand=True)
         self.canvas = tk.Canvas(self.right_container, bg="#121212", highlightthickness=0); self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.canvas.bind("<Button-3>", self.on_canvas_right_down)
+        self.canvas.bind("<ButtonRelease-3>", self.on_canvas_right_up)
         self.canvas.bind("<MouseWheel>", self.on_canvas_scroll)
         self.bottom_piano_f = tk.Frame(self.root, bg=BLACK, height=150); self.bottom_piano_f.pack(side="bottom", fill="x")
         self._build_playable_piano(self.bottom_piano_f); self._build_scale_keys()
@@ -213,9 +224,11 @@ class VoiceRecorderApp:
             draw(nv); self.draw_sequencer(self.pause_elap)
         c.bind("<Button-1>", lambda e: [setattr(self, 'ly', e.y), self.save_state()])
         c.bind("<B1-Motion>", lambda e: [update((self.ly - e.y) * ((vmax-vmin)/100)), setattr(self, 'ly', e.y)])
-        c.bind("<Enter>", lambda e: setattr(self, 'knob_hovered', True))
-        c.bind("<Leave>", lambda e: setattr(self, 'knob_hovered', False))
-        self.knob_refs[(idx, pk)] = draw; draw(self.master_vol if idx == 'M' else self.tracks[idx][pk])
+        c.bind("<Enter>", lambda e: setattr(self, 'knob_hovered', (idx, pk)))
+        c.bind("<Leave>", lambda e: setattr(self, 'knob_hovered', None))
+        self.knob_refs[(idx, pk)] = draw
+        self.knob_updates[(idx, pk)] = update
+        draw(self.master_vol if idx == 'M' else self.tracks[idx][pk])
     def trigger_note(self, m):
         if not self.tracks: return
         tr = self.tracks[self.active_track_idx]
@@ -257,7 +270,18 @@ class VoiceRecorderApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def get_loop_dur(self): return (60.0 / self.bpm) * 4.0
-    def toggle_play(self): self.playing = not self.playing; self.start_t = time.time()-self.pause_elap if self.playing else 0; self.seq_btn.config(text="STOP" if self.playing else "PLAY", bg="#FF4444" if self.playing else "#00C850")
+    def toggle_play(self):
+        if self.playing:
+            dur = self.get_loop_dur()
+            self.pause_elap = (time.time() - self.start_t) % dur
+            self.playing = False
+            self.start_t = 0
+            self.played_cache.clear()
+        else:
+            self.playing = True
+            self.start_t = time.time() - self.pause_elap
+            self.played_cache.clear()
+        self.seq_btn.config(text="STOP" if self.playing else "PLAY", bg="#FF4444" if self.playing else "#00C850")
     def get_quantized_time(self, t):
         qv = self.q_options[self.cur_q.get()]; step = (60.0/self.bpm) * qv
         return round(t / step) * step if qv != 0 else t
@@ -306,13 +330,90 @@ class VoiceRecorderApp:
             is_a = (idx == self.active_track_idx)
             for n in tr['notes']:
                 nx, nw, ny = (n['t']/dur)*w, (n.get('d', 0.4)/dur)*w, (76-n['m'])*rh
-                self.canvas.create_rectangle(nx, ny+2, nx+nw, ny+rh-2, fill=NOTE if is_a else "#555", outline="white" if is_a else "#333")
+                outline = "#FFD700" if n is self.selected_note else ("white" if is_a else "#333")
+                self.canvas.create_rectangle(nx, ny+2, nx+nw, ny+rh-2, fill=NOTE if is_a else "#555", outline=outline)
         self.canvas.create_line((now/dur)*w, 0, (now/dur)*w, h, fill="#00FF80", width=2)
 
+    def _find_note_at(self, x, y):
+        if not self.tracks: return None
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        dur, rh = self.get_loop_dur(), h / 17
+        for n in self.tracks[self.active_track_idx]['notes']:
+            nx, nw, ny = (n['t']/dur)*w, (n.get('d', 0.4)/dur)*w, (76-n['m'])*rh
+            if nx <= x <= nx+nw and ny <= y <= ny+rh:
+                return n
+        return None
+
     def on_canvas_click(self, e):
-        self.pause_elap = (e.x / max(1, self.canvas.winfo_width())) * self.get_loop_dur()
+        if not self.tracks: return
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        dur = self.get_loop_dur()
+        clicked_note = self._find_note_at(e.x, e.y)
+        if clicked_note and (e.state & 0x0004):
+            click_time = (e.x / max(1, w)) * dur
+            split_offset = click_time - clicked_note['t']
+            if 0.05 < split_offset < clicked_note.get('d', 0.4) - 0.05:
+                self.save_state()
+                original_dur = clicked_note.get('d', 0.4)
+                clicked_note['d'] = split_offset
+                self.tracks[self.active_track_idx]['notes'].append({
+                    't': clicked_note['t'] + split_offset,
+                    'm': clicked_note['m'],
+                    'd': original_dur - split_offset
+                })
+            self.draw_sequencer(self.pause_elap)
+            return
+        if clicked_note:
+            self.selected_note = clicked_note
+            nx = (clicked_note['t']/dur)*w
+            nw = (clicked_note.get('d', 0.4)/dur)*w
+            if abs(e.x - (nx + nw)) <= 6:
+                self.save_state()
+                self.drag_note = clicked_note
+                self.drag_start_x = e.x
+                self.drag_start_dur = clicked_note.get('d', 0.4)
+            self.draw_sequencer(self.pause_elap)
+            return
+        self.selected_note = None
+        self.pause_elap = (e.x / max(1, w)) * dur
         if self.playing: self.start_t = time.time() - self.pause_elap
         self.draw_sequencer(self.pause_elap)
+
+    def on_canvas_drag(self, e):
+        if not self.drag_note: return
+        w = max(1, self.canvas.winfo_width())
+        dur = self.get_loop_dur()
+        delta = (e.x - self.drag_start_x) / w * dur
+        new_dur = max(0.05, self.drag_start_dur + delta)
+        self.drag_note['d'] = new_dur
+        self.draw_sequencer(self.pause_elap)
+
+    def on_canvas_release(self, e):
+        self.drag_note = None
+
+    def on_canvas_right_down(self, e):
+        self.duplicate_note = self._find_note_at(e.x, e.y)
+        if self.duplicate_note:
+            if self.duplicate_after_id:
+                self.root.after_cancel(self.duplicate_after_id)
+            self.duplicate_after_id = self.root.after(400, self._duplicate_held_note)
+
+    def on_canvas_right_up(self, e):
+        if self.duplicate_after_id:
+            self.root.after_cancel(self.duplicate_after_id)
+        self.duplicate_after_id = None
+        self.duplicate_note = None
+
+    def _duplicate_held_note(self):
+        if not self.duplicate_note or not self.tracks: return
+        self.save_state()
+        tr = self.tracks[self.active_track_idx]
+        cloned = copy.deepcopy(self.duplicate_note)
+        tr['notes'].append(cloned)
+        self.selected_note = cloned
+        self.draw_sequencer(self.pause_elap)
+        self.duplicate_after_id = None
+        self.duplicate_note = None
 
     def on_canvas_scroll(self, e):
         if not self.tracks or self.active_track_idx >= len(self.tracks): return
@@ -330,7 +431,10 @@ class VoiceRecorderApp:
             self.draw_sequencer(self.pause_elap)
 
     def _on_mousewheel(self, e): 
-        if not self.knob_hovered and self.tracks:
+        if self.knob_hovered in self.knob_updates:
+            delta = 1 if (e.delta > 0 or getattr(e, 'num', 0) == 4) else -1
+            self.knob_updates[self.knob_hovered]((delta) * 0.05)
+        elif self.tracks:
             delta = -1 if (e.delta > 0 or getattr(e, 'num', 0) == 4) else 1
             self.track_canvas.yview_scroll(delta, "units")
 
